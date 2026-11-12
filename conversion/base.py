@@ -2360,6 +2360,16 @@ class TextModel(ModelBase):
         if chkhsh == "a9af07a84191f55098b248ae6f3dfe9e32d3190bebe8eafd91c1ddec9bc3449f":
             # ref: https://huggingface.co/IFM/K2-Horizon-36B
             res = "k2-horizon"
+        if chkhsh == "76f81fd17dcafb5ab3dd73039be55fd90aaebc621cb454e574f3d79cce68b527":
+            # tinyllm's custom-trained tokenizer (v0-recovery, 16389-token vocab):
+            # standard ByteLevel BPE (HF `tokenizers` default), same regex/decoder
+            # mechanics as GPT-2, just a custom vocab - not a novel pre-tokenizer,
+            # just one llama.cpp's reference list never saw.
+            res = "gpt-2"
+        if chkhsh == "6f02c72deaf47692af1eceb1cf48090186c15eb8db749a1984130bd93db030d0":
+            # tinyllm's custom-trained tokenizer (Fennec v1 / tokenizer-redo-16384):
+            # same ByteLevel BPE family as above, different vocab -> different hash.
+            res = "gpt-2"
 
         if res is None:
             logger.warning("\n")

@@ -78,6 +78,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
+    RPC_CMD_SUPPORTS_OP,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -109,6 +110,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_COMM_INIT:         return "COMM_INIT";
         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
+        case RPC_CMD_SUPPORTS_OP:       return "SUPPORTS_OP";
         case RPC_CMD_NONE:              return "NONE";
         default:                        return "UNKNOWN";
     }
@@ -223,6 +225,10 @@ struct rpc_msg_copy_tensor_req {
 };
 
 struct rpc_msg_copy_tensor_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_supports_op_rsp {
     uint8_t result;
 };
 
@@ -1415,6 +1421,7 @@ public:
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
+    bool supports_op(const std::vector<uint8_t> & input, rpc_msg_supports_op_rsp & response);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
     bool comm_allreduce(const rpc_msg_comm_allreduce_req & request);
@@ -2201,6 +2208,83 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     return true;
 }
 
+bool rpc_server::supports_op(const std::vector<uint8_t> & input, rpc_msg_supports_op_rsp & response) {
+    // Same wire format as graph_compute (device | uid | n_nodes | nodes | n_tensors |
+    // tensors), reused deliberately so the client can reuse serialize_graph() as-is.
+    // uid is always 0 here (the client never caches these one-shot queries) so the
+    // graph-reuse/caching machinery graph_compute needs is skipped entirely - this
+    // just reconstructs the one op node (plus whatever sources it transitively needs
+    // to describe its shape/type) and asks the REAL local device, without executing
+    // anything.
+    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
+        return false;
+    }
+    const uint8_t * src = input.data();
+    uint32_t device;
+    memcpy(&device, src, sizeof(device));
+    src += sizeof(device);
+    if (device >= backends.size()) {
+        return false;
+    }
+    src += sizeof(uint64_t); // uid, unused here
+    uint32_t n_nodes;
+    memcpy(&n_nodes, src, sizeof(n_nodes));
+    src += sizeof(n_nodes);
+    if (n_nodes == 0 ||
+        input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
+        return false;
+    }
+    const uint64_t * nodes = (const uint64_t *)src;
+    src += n_nodes*sizeof(uint64_t);
+    uint32_t n_tensors;
+    memcpy(&n_tensors, src, sizeof(n_tensors));
+    src += sizeof(n_tensors);
+    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
+        return false;
+    }
+    const rpc_tensor * tensors = (const rpc_tensor *)src;
+
+    size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
+    std::vector<uint8_t> buffer(buf_size);
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ buffer.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
+    tensor_ptrs.reserve(n_tensors);
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        tensor_ptrs.emplace(tensors[i].id, &tensors[i]);
+    }
+    std::unordered_map<uint64_t, ggml_tensor*> tensor_map;
+    tensor_map.reserve(n_nodes);
+
+    ggml_tensor * op = nullptr;
+    for (uint32_t i = 0; i < n_nodes; i++) {
+        int64_t id;
+        memcpy(&id, &nodes[i], sizeof(id));
+        ggml_tensor * node = create_node(id, ctx, tensor_ptrs, tensor_map);
+        if (node == nullptr && id != 0) {
+            LOG_ERROR("[%s] failed to reconstruct op node %d (id=%" PRId64 ")\n", __func__, i, id);
+            return false;
+        }
+        op = node; // the client always sends the op itself as the last/only node
+    }
+    if (op == nullptr) {
+        return false;
+    }
+
+    ggml_backend_dev_t real_dev = ggml_backend_get_device(backends[device]);
+    bool supported = ggml_backend_dev_supports_op(real_dev, op);
+    LOG_DBG("[%s] device: %u, op: %s, supported: %s\n", __func__, device, ggml_op_name(op->op), supported ? "yes" : "no");
+    response.result = supported ? 1 : 0;
+    return true;
+}
+
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     uint32_t device = request.device;
     if (device >= backends.size()) {
@@ -2699,6 +2783,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SUPPORTS_OP: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_supports_op_rsp response;
+                if (!server.supports_op(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GRAPH_RECOMPUTE: {
                 rpc_msg_graph_recompute_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2892,10 +2990,38 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    // Query the actual remote device rather than assuming support - a prior version
+    // of this function unconditionally returned true, which let ggml_backend_sched's
+    // automatic CPU-fallback-on-unsupported-op logic silently never trigger for RPC
+    // backends: unsupported ops were dispatched to the remote device anyway and
+    // failed/aborted there instead of being rerouted locally ahead of time.
+    //
+    // Reuses the exact same graph serialization the client already uses for real
+    // graph_compute calls (serialize_graph, below) to describe this one op (plus its
+    // direct/transitive sources) to the server, which reconstructs it with the same
+    // create_node() logic graph_compute uses and asks its OWN real device - just
+    // without executing it.
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() + ggml_graph_overhead_custom(1, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * tmp_ctx = ggml_init(params);
+    struct ggml_cgraph * graph = ggml_new_graph_custom(tmp_ctx, 1, false);
+    graph->n_nodes = 1;
+    graph->nodes[0] = (struct ggml_tensor *)op; // not modified, serialize_graph only reads it
+
+    size_t input_size = 0;
+    uint8_t * input = serialize_graph(ctx->device, graph, dispatcher.get(), &input_size);
+    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+    ggml_free(tmp_ctx);
+
+    rpc_msg_supports_op_rsp response;
+    dispatcher->send(RPC_CMD_SUPPORTS_OP, input_ptr, input_size, &response, sizeof(response));
+    return response.result != 0;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

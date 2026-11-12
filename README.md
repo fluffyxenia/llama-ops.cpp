@@ -17,6 +17,28 @@
 
 </div>
 
+## llama-ops.cpp: this fork
+
+This is a personal fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), kept in sync with upstream, carrying one real fix discovered while using `ggml-rpc` for something it had never really been exercised for before: **training** (forward + backward + optimizer step) a small custom neural net remotely over RPC, on a Vulkan backend, as part of an unrelated Reinforcement Learning project (teaching a tiny ~289K-parameter policy net to play a Sega Genesis game).
+
+### The headline finding
+
+**`ggml` can train neural nets on Vulkan, not just CUDA** - this isn't obvious from the existing docs/examples, which overwhelmingly assume CUDA for anything beyond pure inference. Vulkan is a viable backend for real forward+backward+AdamW training today, including over a remote `ggml-rpc` connection, on ordinary consumer/integrated GPU hardware (this was validated on an Intel UHD 600 iGPU).
+
+### The bug this uncovered, and the fix
+
+While chasing a crash during Vulkan-backed RPC training, we found that `ggml_backend_rpc_device_supports_op()` in `ggml/src/ggml-rpc/ggml-rpc.cpp` had unconditionally returned `true` since the RPC backend was first added in 2024 - over two years, through countless releases. This stub silently disabled `ggml_backend_sched`'s automatic CPU-fallback-for-unsupported-ops for every RPC-backed device: any op the remote backend didn't actually support got dispatched there anyway and crashed, instead of being caught and rerouted to CPU ahead of time, exactly as `supports_op` exists to do.
+
+It likely went unnoticed for so long because RPC's dominant real-world use case - splitting one known-good LLM's inference graph across machines - only ever exercises a small, universally-supported op set. Training an arbitrary small custom architecture hits real per-backend op-coverage gaps (in our case, Vulkan's Mesa ANV driver missing `OUT_PROD`, needed for a dense layer's backward pass) that a pure-inference RPC user would basically never trigger.
+
+**The fix** (on the `vulkan-rpc-training` branch) implements a real `supports_op` check instead of the stub, reusing the existing `serialize_graph()`/`create_node()` wire-format infrastructure already used by graph execution, just for a one-node, non-executing query. Full technical writeup, including the exact commits that establish the bug's age, the fix's design, and bit-for-bit verification methodology (matching loss values before/after the fix) is in [`RPC_SUPPORTS_OP_NOTES.md`](RPC_SUPPORTS_OP_NOTES.md).
+
+A second, follow-on bug surfaced once the fix made real CPU-fallback possible during training (`ggml-opt.cpp`'s `GGML_ASSERT(opt_ctx->eval_ready)` failing on the second training step once a graph is genuinely split across two backends) - documented in the same notes file as an open item, not yet root-caused.
+
+This fix may eventually be submitted upstream as a real PR to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp); until then, it lives here.
+
+</div>
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
